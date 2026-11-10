@@ -1,0 +1,10 @@
+# Layer applied by --no-lidar (on top of default.yaml and any --config file).
+# See gate2/no_lidar.py and README "No-lidar mode".
+no_lidar:
+  enabled: true
+ros:
+  scan_topic: ""                          # never subscribe to / read the lidar
+geo:
+  altitude_sources: [rel_alt, pose, fixed]   # lidar removed from the chain; the
+                                             # altitude is used only for GPS and to
+                                             # show stature in metres, never for the angle

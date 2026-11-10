@@ -1,0 +1,164 @@
+# Gate-2 waist-angle pipeline -- default configuration.
+#
+# Every key can be overridden from the command line with
+#   --set section.key=value        e.g. --set depth.tile_res=504
+# Lists take YAML syntax:  --set "depth.models=[base,small]"
+# Paths may use ~ and are resolved at load time.
+
+paths:
+  flypose_root: ~/fly_pose/model              # FlyPose: checkpoints/, src/flypose/
+  da3_root: ~/Depth-Anything-3                # Depth-Anything-3 clone (src/depth_anything_3)
+  da3_weights_dirs:                           # searched for <REPO>/model.safetensors
+    - ~/Depth-Anything-3/checkpoints
+    - ~/Depth-Anything-V2/checkpoints
+  gate1_root: ~/GATE_1_PIPELINE/deployment_gate_1   # coordinate_transformer.py
+
+# --------------------------------------------------------------------------
+# Stage 1: person detection + 2D keypoints (FlyPose)
+# --------------------------------------------------------------------------
+pose:
+  model: h                    # h = FlyPose ViTPose-H (accurate), s = ViTPose-S (fast)
+  fallback_models: [s]        # tried in order if the primary fails to load/run
+  providers: [TensorrtExecutionProvider, CUDAExecutionProvider, CPUExecutionProvider]
+  detector: flypose           # flypose | yolo
+  detector_fallback: yolo     # used if the primary detector fails (null = none)
+  yolo_weights: ~/Depth-Anything-V2/yoloe-26x-seg.pt
+  det_conf: 0.5
+  det_iou: 0.3
+  # How the frame is fitted into the detector's fixed 1280x1280 input.
+  # stretch = original FlyPose behaviour; letterbox keeps the aspect ratio.
+  resize_mode: letterbox
+  letterbox_long_side: 1280
+  kp_thr: 0.3                 # keypoint confidence below this counts as missing
+  max_persons: 6              # pose (the slow part) runs on the top-N boxes only
+  min_box_px: 16              # boxes smaller than this on their long side are ignored
+  primary_only: false         # true = keep only the single most person-like detection
+
+# --------------------------------------------------------------------------
+# Stage 2: relative depth relief of each person (Depth-Anything-3)
+# --------------------------------------------------------------------------
+depth:
+  enabled: true
+  device: auto                # auto | cuda | cpu
+  models: [mono-large, base, small]   # tried in order; the first that loads is used
+  tile_res: 1008              # DA3 input side for the zoomed person crop (/14 grid), offline
+  tile_res_live: 504          # used in live mode: 177 vs 696 ms/person on an RTX 3050,
+                              # angles within 1.4 deg median of 1008 on 25m_2x_1.5ms
+  min_tile_res: 336           # on CUDA OOM the resolution is halved down to this
+  margin: 0.25                # ground ring around the box, fraction of its long side
+  ring_pad: 6                 # px kept clear between the box and the ground ring
+  sample_radius_frac: 0.03    # keypoint depth = median in a disc of this x box long side
+  min_relief_snr: 3.0         # torso/leg relief below this x ring noise counts as flat
+  max_persons: 3              # DA3 runs on the N most confident people per frame (it is the slow part)
+
+# --------------------------------------------------------------------------
+# Stage 3: geolocalisation (Gate-1 CoordinateTransformer)
+# --------------------------------------------------------------------------
+geo:
+  # Camera intrinsics profile (see README "Intrinsics"):
+  #   fcb_2x   measured FCB calibration, 2x digital zoom = centred 1920x1080 crop
+  #   fcb_1x   same calibration, 1x = full 3840x2160 frame scaled to the stream
+  #   gate1    the SONY FCB matrix hard-coded in GATE_1 v2 Pipeline
+  #   camera_info  whatever the camera_info topic says (placeholder on these bags)
+  #   custom   use geo.custom_K / custom_K_size / custom_K_mode below
+  intrinsics: fcb_2x
+  custom_K: [3168.05596, 3163.04946, 1906.55092, 1037.94710]
+  custom_K_size: [3840, 2160]
+  custom_K_mode: crop         # crop | scale | asis
+  zoom_ratio: 1.0             # extra optical zoom relative to the profile (Gate-1 semantics)
+  camera_offset_body: [0.29, 0.03, 0.06]   # camera lever arm, body FRD metres (Gate-1)
+  # SF45 lidar lever arm, body FRD metres, used by run_depth_stats.py for the
+  # lidar-to-camera parallax. NOT MEASURED on this airframe: null = at the
+  # camera (no lidar-camera parallax). Its vertical part enters depth 1:1.
+  lidar_offset_body: null
+  # Camera boresight trim, small rotation about the camera axes (x right,
+  # y down, z optical), degrees. NOT MEASURED: 0 = boresight exactly body-down.
+  # 1 deg of tilt moves the depth ~13 cm at the frame edge at 25 m.
+  camera_mount_deg: [0.0, 0.0, 0.0]
+  # Height of the camera above the ground: first source with a fresh value wins.
+  altitude_sources: [rel_alt, scan, pose, fixed]
+  fixed_altitude_m: null      # last resort; null = no fixed fallback
+  lidar_range_scale: 0.926    # SF45 reads ~8% long against rel_alt/GPS (1/1.08)
+  heading_sources: [compass, imu]
+  max_age_s: 1.0              # telemetry older than this (vs image stamp) is ignored
+  assume_nadir_if_no_imu: true
+
+# --------------------------------------------------------------------------
+# Stage 4: waist (hip) angle
+# --------------------------------------------------------------------------
+angle:
+  # Fallback chain, first that succeeds is reported. Every method measures the
+  # angle between 3D vectors:
+  #   3d_depth        DA3 relief gives each keypoint its height (default)
+  #   3d_equal_depth  no depth: all keypoints at equal height above the ground
+  #   3d_anthro       no depth: rise guessed from foreshortening + body proportions
+  #                   (assumes the torso/thigh rise away from the hip; opt-in)
+  methods: [3d_depth, 3d_equal_depth]
+  stature_prior_m: 1.70
+  stature_sigma_m: 0.12
+  stature_bounds_m: [1.2, 2.1]
+  use_knee_if_no_ankle: true  # leg = hip->ankle; hip->knee only when the ankle is not detected
+  # orientation of the hip->shoulder and hip->ankle vectors against the ground
+  parallel_max_deg: 20.0      # |elevation| <= this: parallel to the ground
+  perpendicular_min_deg: 70.0 # |elevation| >= this: perpendicular to the ground
+  aligned_min_deg: 165.0      # hip angle >= this: torso and leg aligned (one straight line)
+  foreshortened_frac: 0.55    # torso/thigh shorter than this x expected = pointing at the camera
+                              # (lower end hidden): its rise comes from its length, not DA3
+  # A thigh pointing at the camera is ambiguous from straight above: knees drawn
+  # up vs. hanging down. posture: ground = casualty on the ground (decide from the
+  # knee's surface height relative to the top of the body, knee_ratio [flat, up]);
+  # upright = standing/kneeling subjects (thigh hangs down).
+  posture: ground
+  hip_height_ground_m: 0.12   # posture=ground: hip joint height cap (pelvis resting on the ground)
+  knee_ratio: [0.35, 0.55]
+  scale_prior_weight: 1.0     # pull of the track-median DA3 scale on each frame's solve
+  overlap_deg: 30.0           # torso/thigh closer than this in the image: thigh assumed under the torso
+  min_segment_px: 4           # a 2D segment shorter than this is unusable
+  smoothing_window: 7         # per-track rolling median over this many measurements
+  track_iou: 0.3
+  track_max_missed: 15
+  track_world_gate_m: 2.0     # match a detection to a track within this ground distance (needs GPS)
+
+# --------------------------------------------------------------------------
+# ROS interface (live and `ros2 bag play`)
+# --------------------------------------------------------------------------
+ros:
+  node_name: gate2_waist_angle
+  image_topic: /fcb/image/ffmpeg       # sensor_msgs/Image, CompressedImage or FFMPEGPacket
+  image_transport: auto                # auto | raw | compressed | ffmpeg
+  image_fallback_topics: [/fcb/image/decoded, /fcb/image/raw, /fcb/image/compressed]
+  imu_topic: /mavros/imu/data
+  rel_alt_topic: /mavros/global_position/rel_alt
+  gps_topic: /mavros/global_position/global
+  compass_topic: /mavros/global_position/compass_hdg
+  scan_topic: /scan
+  pose_topic: /mavros/local_position/pose
+  camera_info_topic: /fcb/camera_info
+  buffer_span_s: 5.0
+  publish_image_topic: /gate2/annotated      # empty = do not publish
+  publish_result_topic: /gate2/waist_angles  # std_msgs/String with JSON; empty = off
+  stats_every_s: 3.0
+
+# --------------------------------------------------------------------------
+# No-lidar mode (--no-lidar loads config/no_lidar.yaml on top of this file)
+# --------------------------------------------------------------------------
+no_lidar:
+  enabled: false              # true: gate2/no_lidar.py -- relative DA3 depth, no /scan at all
+
+# --------------------------------------------------------------------------
+# Display and outputs
+# --------------------------------------------------------------------------
+display:
+  enabled: true
+  width: 1280                 # window width in px (the frame is scaled to fit)
+  show_relief_inset: true     # DA3 relief of the primary person in a corner inset
+  window_name: Gate-2 waist angle
+
+output:
+  dir: ~/Gate-2_Pipeline/outputs
+  video: null                 # mp4 path, "auto" = <dir>/<run>.mp4, null = none
+  log: auto                   # JSONL per measurement, "auto" = <dir>/<run>.jsonl, null = none
+  frames: auto                # annotated JPEG + JSON for every frame with a detected person,
+                              # "auto" = <dir>/<run>_frames/, null = none
+  frames_raw: false           # also save the unannotated frame (<name>_raw.jpg)
+  frames_all: false           # save every processed frame, not only those with people
